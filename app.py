@@ -134,6 +134,20 @@ with st.sidebar:
         help="Chunks with probability p >= τ are passed to NVIDIA NIM. Lower values include more chunks; higher values are stricter.",
     )
 
+    model_options = [
+        "meta/llama-3.1-8b-instruct",
+        "meta/llama-3.1-70b-instruct",
+        "meta/llama-3.3-70b-instruct",
+        "mistralai/mistral-7b-instruct-v0.3",
+        "nvidia/llama-3.1-nemotron-70b-instruct",
+    ]
+    selected_model = st.selectbox(
+        "NVIDIA NIM Model",
+        options=model_options,
+        index=0,
+        help="Select model on NVIDIA NIM. Use meta/llama-3.1-8b-instruct for standard free accounts.",
+    )
+
     st.markdown("---")
     st.markdown("#### 📚 Document Library")
 
@@ -198,19 +212,31 @@ if run_btn or (current_question and current_question != st.session_state.get("la
 
         # Progress indicator
         with st.status("Executing RAG Pipeline...", expanded=True) as status:
-            st.write("🔎 Step 1: Hybrid Search (FAISS dense + BM25 keyword fusion)...")
-            st.write("⚖ Step 2: Scoring 20 candidate chunks with Jev AI System-1...")
-            st.write("🛡 Step 3: Checking answerability & prompt injection gates...")
+            st.write("🔎 Step 1: Running Hybrid Search (FAISS dense + BM25 keyword fusion)...")
 
             try:
-                passages, p, kept, answer = rag.ask(current_question, tau=tau)
-                status.update(label="Pipeline Complete!", state="complete", expanded=False)
+                passages, p, kept, answer, jev_error = rag.ask(current_question, tau=tau, model_name=selected_model)
+                if jev_error:
+                    st.write(f"⚠️ Step 2: Jev AI skipped/errored: {jev_error}")
+                    st.write("🤖 Step 3: Answering directly from top document chunks (Standard RAG)...")
+                    status.update(label="Pipeline Complete (Standard RAG Mode)", state="complete", expanded=False)
+                else:
+                    st.write("⚖ Step 2: Scored candidate chunks with Jev AI System-1...")
+                    st.write("🛡 Step 3: Verified answerability & prompt injection gates...")
+                    st.write("🤖 Step 4: Generated answer using Jev-verified passages...")
+                    status.update(label="Pipeline Complete (Jev Gatekeeper Mode)", state="complete", expanded=False)
             except Exception as e:
                 status.update(label="Error running pipeline", state="error", expanded=True)
                 st.error(f"Execution Error: {e}")
-                if "TYPESAFE_API_KEY" in str(e) or not typesafe_key or typesafe_key == "your_typesafe_api_key_here":
-                    st.info("💡 Hint: Make sure your `TYPESAFE_API_KEY` is configured in your `.env` file.")
                 st.stop()
+
+        # Notice if Jev errored out and standard RAG answered without it
+        if jev_error:
+            st.info(
+                f"ℹ️ **Standard RAG Mode Active (Without Jev):**\n\n"
+                f"Reason: `{jev_error}`\n\n"
+                "The system did not wait for Jev. Your question was answered directly from the top matching passages in your documents using NVIDIA NIM."
+            )
 
         # Quality & Safety Gate Metrics
         m1, m2, m3, m4 = st.columns(4)
@@ -221,41 +247,69 @@ if run_btn or (current_question and current_question != st.session_state.get("la
         total_candidates = len(passages)
         dropped_pct = ((total_candidates - kept_count) / total_candidates * 100) if total_candidates else 0
 
-        with m1:
-            st.metric(
-                label="Answerability Gate",
-                value=f"{ans_score:.2f}",
-                delta="Passed" if ans_score >= tau else "Failed (< τ)",
-                delta_color="normal" if ans_score >= tau else "inverse",
-            )
-        with m2:
-            st.metric(
-                label="Injection Risk Gate",
-                value=f"{inj_score:.2f}",
-                delta="Clean" if inj_score < tau else "Attack Detected",
-                delta_color="normal" if inj_score < tau else "inverse",
-            )
-        with m3:
-            st.metric(
-                label="Chunks Kept",
-                value=f"{kept_count} / {total_candidates}",
-                delta=f"Threshold τ = {tau:.2f}",
-            )
-        with m4:
-            st.metric(
-                label="Noise Filtered",
-                value=f"{dropped_pct:.0f}%",
-                delta="Distractors removed",
-            )
+        if jev_error:
+            with m1:
+                st.metric(
+                    label="Answerability Gate",
+                    value="Bypassed",
+                    delta="Jev Error",
+                    delta_color="off",
+                )
+            with m2:
+                st.metric(
+                    label="Injection Risk Gate",
+                    value="Bypassed",
+                    delta="Jev Error",
+                    delta_color="off",
+                )
+            with m3:
+                st.metric(
+                    label="Chunks Kept",
+                    value=f"{kept_count} / {total_candidates}",
+                    delta="Top 5 Fallback",
+                )
+            with m4:
+                st.metric(
+                    label="Noise Filtered",
+                    value=f"{dropped_pct:.0f}%",
+                    delta="Non-top candidates",
+                )
+        else:
+            with m1:
+                st.metric(
+                    label="Answerability Gate",
+                    value=f"{ans_score:.2f}",
+                    delta="Passed" if ans_score >= tau else "Failed (< τ)",
+                    delta_color="normal" if ans_score >= tau else "inverse",
+                )
+            with m2:
+                st.metric(
+                    label="Injection Risk Gate",
+                    value=f"{inj_score:.2f}",
+                    delta="Clean" if inj_score < tau else "Attack Detected",
+                    delta_color="normal" if inj_score < tau else "inverse",
+                )
+            with m3:
+                st.metric(
+                    label="Chunks Kept",
+                    value=f"{kept_count} / {total_candidates}",
+                    delta=f"Threshold τ = {tau:.2f}",
+                )
+            with m4:
+                st.metric(
+                    label="Noise Filtered",
+                    value=f"{dropped_pct:.0f}%",
+                    delta="Distractors removed",
+                )
 
         st.markdown("---")
 
         # Answer Section
         st.subheader("💡 Answer")
 
-        if inj_score >= tau:
+        if not jev_error and inj_score >= tau:
             st.error(f"🛡 **{answer}**\n\nJev flagged this request as a potential prompt injection attack.")
-        elif ans_score < tau or not kept:
+        elif not jev_error and (ans_score < tau or not kept):
             st.warning(f"🔍 **{answer}**\n\nThe documents do not contain sufficient verified information to answer this question.")
         else:
             st.markdown(f'<div class="answer-box">{answer}</div>', unsafe_allow_html=True)
@@ -271,34 +325,48 @@ if run_btn or (current_question and current_question != st.session_state.get("la
 
         with tab_kept:
             if not kept:
-                st.info("No chunks met the threshold τ.")
+                st.info("No chunks were selected.")
             else:
                 for cid in kept:
-                    prob = p.get(cid, 0.0)
-                    with st.expander(f"**[{cid}]** — Relevance Probability: `{prob:.2f}` (Kept for LLM context)", expanded=True):
-                        st.progress(prob, text=f"Jev confidence: {prob*100:.1f}%")
-                        st.text_area(f"Content for {cid}", passages[cid], height=110, disabled=True)
+                    if jev_error:
+                        with st.expander(f"**[{cid}]** — Hybrid Candidate (Passed to NVIDIA NIM)", expanded=True):
+                            st.caption("Jev probability unavailable due to error. Chunk selected via Reciprocal Rank Fusion.")
+                            st.text_area(f"Content for {cid}", passages[cid], height=110, disabled=True)
+                    else:
+                        prob = p.get(cid, 0.0)
+                        with st.expander(f"**[{cid}]** — Relevance Probability: `{prob:.2f}` (Kept for LLM context)", expanded=True):
+                            st.progress(prob, text=f"Jev confidence: {prob*100:.1f}%")
+                            st.text_area(f"Content for {cid}", passages[cid], height=110, disabled=True)
 
         with tab_all:
-            st.caption(f"Showing all 20 retrieved candidates. Green indicates chunks passed (>= {tau:.2f}); Gray indicates chunks dropped.")
-            for cid, text in passages.items():
-                prob = p.get(cid, 0.0)
-                is_kept = cid in kept
-                badge = "🟢 KEPT" if is_kept else "⚪ DROPPED"
-                with st.expander(f"{badge} **[{cid}]** — Jev Score: `{prob:.2f}`"):
-                    st.progress(prob, text=f"Score: {prob:.2f}")
-                    st.text(text)
+            if jev_error:
+                st.caption(f"Showing all {total_candidates} retrieved candidates. Jev scoring was bypassed; top {kept_count} were passed to NVIDIA NIM.")
+                for cid, text in passages.items():
+                    is_kept = cid in kept
+                    badge = "🟢 KEPT (Fallback)" if is_kept else "⚪ DROPPED"
+                    with st.expander(f"{badge} **[{cid}]**"):
+                        st.text(text)
+            else:
+                st.caption(f"Showing all 20 retrieved candidates. Green indicates chunks passed (>= {tau:.2f}); Gray indicates chunks dropped.")
+                for cid, text in passages.items():
+                    prob = p.get(cid, 0.0)
+                    is_kept = cid in kept
+                    badge = "🟢 KEPT" if is_kept else "⚪ DROPPED"
+                    with st.expander(f"{badge} **[{cid}]** — Jev Score: `{prob:.2f}`"):
+                        st.progress(prob, text=f"Score: {prob:.2f}")
+                        st.text(text)
 
         with tab_raw:
             st.json(
                 {
                     "query": current_question,
                     "threshold_tau": tau,
+                    "jev_error": jev_error,
                     "safety_gates": {
-                        "answerable_prob": ans_score,
-                        "injection_prob": inj_score,
+                        "answerable_prob": ans_score if not jev_error else "N/A",
+                        "injection_prob": inj_score if not jev_error else "N/A",
                     },
-                    "chunk_probabilities": {cid: round(p[cid], 4) for cid in passages},
+                    "chunk_probabilities": {cid: round(p[cid], 4) for cid in passages} if not jev_error else "N/A (Bypassed)",
                     "selected_chunks": kept,
                 }
             )

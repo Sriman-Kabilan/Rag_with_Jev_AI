@@ -88,9 +88,9 @@ For each query, Jev checks:
 4. **Hybrid Retrieval with Reciprocal Rank Fusion (RRF):** Queries both indexes, scoring each candidate chunk as:
    $$\text{RRF Score} = \sum \frac{1}{60 + \text{rank}}$$
    Top 20 candidates are selected.
-5. **Jev Probability Evaluation:** Sends the state and 22 questions to Jev in a single round-trip.
+5. **Jev Probability Evaluation:** Sends the state and 22 questions to Jev in a single round-trip. *(If Jev encounters an error, such as a missing key or rate limit, the pipeline displays the error and gracefully falls back to the top hybrid search candidates without stalling).*
 6. **Filtering:** Chunks with $p(C_i) \ge \tau$ are kept; others are dropped.
-7. **Synthesis:** If gates pass, `ChatOpenAI` connects to the **NVIDIA NIM** API endpoint to formulate an answer strictly citing the kept passages.
+7. **Synthesis:** `ChatOpenAI` connects to the **NVIDIA NIM** API endpoint to formulate an answer strictly citing the context passages.
 
 ---
 
